@@ -9,6 +9,10 @@ import json
 import platform
 import yaml
 import six
+import gzip
+import functools
+import time
+import requests
 
 # HACK: restore first two entries of sys path after wandb load
 save_path = sys.path[:2]
@@ -57,6 +61,7 @@ def default_ctx():
         "artifacts": {},
         "artifacts_by_id": {},
         "artifacts_created": {},
+        "portfolio_links": {},
         "upsert_bucket_count": 0,
         "out_of_date": False,
         "empty_query": False,
@@ -65,7 +70,7 @@ def default_ctx():
         "run_queues": {"1": []},
         "num_popped": 0,
         "num_acked": 0,
-        "max_cli_version": "0.12.0",
+        "max_cli_version": "0.13.0",
         "runs": {},
         "run_ids": [],
         "file_names": [],
@@ -85,6 +90,10 @@ def default_ctx():
         "invalid_launch_spec_project": False,
         "n_sweep_runs": 0,
         "code_saving_enabled": True,
+        "sentry_events": [],
+        "run_cuda_version": None,
+        # relay mode, keep track of upsert runs for validation
+        "relay_run_info": {},
     }
 
 
@@ -95,7 +104,7 @@ def mock_server(mocker):
     mock = RequestsMock(app, ctx)
     # We mock out all requests libraries, couldn't find a way to mock the core lib
     sdk_path = "wandb.sdk"
-    mocker.patch("gql.transport.requests.requests", mock)
+    mocker.patch("wandb_gql.transport.requests.requests", mock)
     mocker.patch("wandb.wandb_sdk.internal.file_stream.requests", mock)
     mocker.patch("wandb.wandb_sdk.internal.internal_api.requests", mock)
     mocker.patch("wandb.wandb_sdk.internal.update.requests", mock)
@@ -310,7 +319,12 @@ def _bucket_config(ctx):
             "edges": [
                 {
                     "node": {
-                        "directUrl": base_url + "/storage?file=" + name,
+                        "url": base_url + "/storage?file=" + name,
+                        "directUrl": base_url
+                        + "/storage?file="
+                        + name
+                        + "&direct=true",
+                        "updatedAt": datetime.now().isoformat(),
                         "name": name,
                     }
                 }
@@ -336,12 +350,114 @@ class HttpException(Exception):
         return rv
 
 
+class SnoopRelay:
+
+    _inject_count: int
+    _inject_time: float
+
+    def __init__(self):
+        self._inject_count = 0
+        self._inject_time = 0.0
+
+    def relay(self, func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+
+            # Normal mockserver mode, disable live relay and call next function
+            if not os.environ.get("MOCKSERVER_RELAY"):
+                return func(*args, **kwargs)
+
+            if request.method == "POST":
+                url_path = request.path
+                body = request.get_json()
+
+                url = f"https://api.wandb.ai{url_path}"
+                resp = requests.post(url, json=body)
+                data = resp.json()
+                run_obj = data.get("data", {}).get("upsertBucket", {}).get("bucket", {})
+                project_obj = run_obj.get("project", {})
+
+                run_id = run_obj.get("name")
+                project = project_obj.get("name")
+                entity = project_obj.get("entity", {}).get("name")
+
+                ctx = get_ctx()
+                if run_id:
+                    ctx["relay_run_info"].setdefault(run_id, {})
+                    ctx["relay_run_info"][run_id]["project"] = project
+                    ctx["relay_run_info"][run_id]["entity"] = entity
+
+                # TODO: This is a hardcoded for now, will add inject specification to the yea file
+                if run_id and run_id.startswith("inject"):
+                    time_now = time.time()
+                    if self._inject_count == 0:
+                        self._inject_time = time_now
+                    self._inject_count += 1
+                    if time_now < self._inject_time + 21:
+                        # print("INJECT", self._inject_count, time_now, self._inject_time)
+                        time.sleep(12)
+                        raise HttpException("some error", status_code=500)
+                return data
+            assert False
+
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    def context_enrich(self, ctx):
+        for run_id, run_info in ctx["relay_run_info"].items():
+            run_num = len(ctx["runs"])
+            insert = run_id not in ctx["run_ids"]
+            if insert:
+                ctx["run_ids"].append(run_id)
+            run_ctx = ctx["runs"].setdefault(run_id, default_ctx())
+
+            # NOTE: not used, added for consistancy with non-relay mode
+            r = run_ctx.setdefault("run", {})
+            r.setdefault("display_name", f"relay_name-{run_num}")
+            r.setdefault("storage_id", f"storageid{run_num}")
+            r.setdefault("project_name", "relay_proj")
+            r.setdefault("entity_name", "relay_entity")
+
+            # TODO: handle errors better
+            try:
+                # NOTE: We are using wandb but it isnt a strict depenedency
+                import wandb
+
+                api = wandb.Api()
+                run = api.run(f"{run_info['entity']}/{run_info['project']}/{run_id}")
+            except Exception as e:
+                print(f"ERROR: problem calling public api for run {run_id}", e)
+                continue
+
+            value_config = {k: dict(value=v) for k, v in run.rawconfig.items()}
+            # TODO: need to have a correct state mapping
+            exitcode = 0 if run.state == "finished" else 1
+
+            for c in ctx, run_ctx:
+                c.setdefault("config", []).append(dict(value_config))
+                c.setdefault("file_stream", []).append(
+                    dict(
+                        exitcode=exitcode,
+                        files={
+                            "wandb-summary.json": dict(
+                                offset=0, content=[json.dumps(run.summary_metrics)]
+                            )
+                        },
+                    )
+                )
+            ctx["runs"][run_id] = run_ctx
+        # print("SEND", ctx)
+        return ctx
+
+
 def create_app(user_ctx=None):
     app = Flask(__name__)
     # When starting in live mode, user_ctx is a fancy object
     if isinstance(user_ctx, dict):
         with app.app_context():
             set_ctx(user_ctx)
+    snoop = SnoopRelay()
 
     @app.teardown_appcontext
     def persist_ctx(exc):
@@ -362,6 +478,7 @@ def create_app(user_ctx=None):
         ctx = get_ctx()
         body = request.get_json()
         if request.method == "GET":
+            ctx = snoop.context_enrich(ctx)
             return json.dumps(ctx)
         elif request.method == "DELETE":
             app.logger.info("reseting context")
@@ -375,6 +492,7 @@ def create_app(user_ctx=None):
             return json.dumps(get_ctx())
 
     @app.route("/graphql", methods=["POST"])
+    @snoop.relay
     def graphql():
         #  TODO: in tests wandb-username is set to the test name, lets scope ctx to it
         ctx = get_ctx()
@@ -549,7 +667,10 @@ def create_app(user_ctx=None):
                 else:
                     project_field_name = "model"
                     run_field_name = "bucket"
-                if "commit" in body["query"]:
+                if (
+                    "commit" in body["query"]
+                    or body["variables"].get("fileName") == "wandb-metadata.json"
+                ):
                     run_config = _bucket_config(ctx)
                 else:
                     run_config = run(ctx)
@@ -886,6 +1007,9 @@ def create_app(user_ctx=None):
                     }
                 )
             return json.dumps({"data": {"prepareFiles": {"files": {"edges": nodes}}}})
+        if "mutation LinkArtifact(" in body["query"]:
+            if ART_EMU:
+                return ART_EMU.link(variables=body["variables"])
         if "mutation CreateArtifact(" in body["query"]:
             if ART_EMU:
                 return ART_EMU.create(variables=body["variables"])
@@ -1661,13 +1785,16 @@ def create_app(user_ctx=None):
                     },
                 }
         elif file == "wandb-metadata.json":
-            return {
+            result = {
                 "docker": "test/docker",
                 "program": "train.py",
                 "codePath": "train.py",
                 "args": ["--test", "foo"],
                 "git": ctx.get("git", {}),
             }
+            if ctx["run_cuda_version"]:
+                result["cuda"] = ctx["run_cuda_version"]
+            return result
         elif file == "requirements.txt":
             return "numpy==1.19.5\n"
         elif file == "diff.patch":
@@ -1775,6 +1902,7 @@ index 30d74d2..9a2c773 100644
         return "ARTIFACT %s" % digest, 200
 
     @app.route("/files/<entity>/<project>/<run>/file_stream", methods=["POST"])
+    @snoop.relay
     def file_stream(entity, project, run):
         ctx = get_ctx()
         run_ctx = get_run_ctx(run)
@@ -1846,6 +1974,16 @@ index 30d74d2..9a2c773 100644
                 },
             }
         )
+
+    @app.route("/api/5288891/store/", methods=["POST"])
+    def sentry_put():
+        ctx = get_ctx()
+        data = request.get_data()
+        data = gzip.decompress(data)
+        data = str(data, "utf-8")
+        data = json.loads(data)
+        ctx["sentry_events"].append(data)
+        return ""
 
     @app.errorhandler(404)
     def page_not_found(e):
@@ -2029,6 +2167,10 @@ class ParseCTX(object):
         return self._ctx.get("artifacts_created") or {}
 
     @property
+    def portfolio_links(self):
+        return self._ctx.get("portfolio_links") or {}
+
+    @property
     def tags(self):
         return self._ctx.get("tags") or []
 
@@ -2060,6 +2202,10 @@ class ParseCTX(object):
     def alerts(self):
         return self._ctx.get("alerts") or []
 
+    @property
+    def sentry_events(self):
+        return self._ctx.get("sentry_events") or []
+
     def _debug(self):
         if not self._run_id:
             items = {"run_ids": "run_ids", "artifacts": "artifacts"}
@@ -2082,4 +2228,11 @@ if __name__ == "__main__":
 
     app = create_app()
     app.logger.setLevel(logging.INFO)
-    app.run(debug=False, port=int(os.environ.get("PORT", 8547)))
+
+    # allow caller to bind to a specific hostaddr
+    mockserver_bind = os.environ.get("MOCKSERVER_BIND")
+    kwargs = {}
+    if mockserver_bind:
+        kwargs["host"] = mockserver_bind
+
+    app.run(debug=False, port=int(os.environ.get("PORT", 8547)), **kwargs)

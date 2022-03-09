@@ -24,14 +24,11 @@ exclude =
     ./wandb/old/
     ./wandb/proto/
     ./wandb/proto_check/
-    ./wandb/util.py
     ./wandb/env.py
     ./wandb/sweeps/
     ./wandb/integration/magic.py
     ./wandb/integration/keras/
     ./wandb/integration/tensorboard/
-    ./wandb/integration/xgboost/
-    ./wandb/integration/fastai/
     ./wandb/integration/metaflow/
     ./wandb/filesync/
     ./wandb/sdk/internal/internal_api.py

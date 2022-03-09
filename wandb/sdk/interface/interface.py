@@ -16,8 +16,6 @@ import os
 from typing import Any, Iterable, Optional, Tuple, Union
 from typing import TYPE_CHECKING
 
-import six
-from wandb import data_types
 from wandb.proto import wandb_internal_pb2 as pb
 from wandb.proto import wandb_telemetry_pb2 as tpb
 from wandb.util import (
@@ -33,6 +31,7 @@ from wandb.util import (
 from . import summary_record as sr
 from .artifacts import ArtifactManifest
 from .message_future import MessageFuture
+from ..data_types.utils import history_dict_to_json, val_to_json
 from ..wandb_artifacts import Artifact
 
 if TYPE_CHECKING:
@@ -140,10 +139,10 @@ class InterfaceBase(object):
     ) -> pb.ConfigRecord:
         config = obj or pb.ConfigRecord()
         if data:
-            for k, v in six.iteritems(data):
+            for k, v in data.items():
                 update = config.update.add()
                 update.key = k
-                update.value_json = json_dumps_safer(json_friendly(v)[0])  # type: ignore
+                update.value_json = json_dumps_safer(json_friendly(v)[0])
         if key:
             update = config.update.add()
             if isinstance(key, tuple):
@@ -151,7 +150,7 @@ class InterfaceBase(object):
                     update.nested_key.append(k)
             else:
                 update.key = key
-            update.value_json = json_dumps_safer(json_friendly(val)[0])  # type: ignore
+            update.value_json = json_dumps_safer(json_friendly(val)[0])
         return config
 
     def _make_run(self, run: "Run") -> pb.RunRecord:
@@ -229,7 +228,7 @@ class InterfaceBase(object):
 
     def _make_summary_from_dict(self, summary_dict: dict) -> pb.SummaryRecord:
         summary = pb.SummaryRecord()
-        for k, v in six.iteritems(summary_dict):
+        for k, v in summary_dict.items():
             update = summary.update.add()
             update.key = k
             update.value_json = json.dumps(v)
@@ -252,19 +251,17 @@ class InterfaceBase(object):
 
         if isinstance(value, dict):
             json_value = {}
-            for key, value in six.iteritems(value):
+            for key, value in value.items():
                 json_value[key] = self._summary_encode(
                     value, path_from_root + "." + key
                 )
             return json_value
         else:
-            friendly_value, converted = json_friendly(  # type: ignore
-                data_types.val_to_json(
-                    self._run, path_from_root, value, namespace="summary"
-                )
+            friendly_value, converted = json_friendly(
+                val_to_json(self._run, path_from_root, value, namespace="summary")
             )
-            json_value, compressed = maybe_compress_summary(  # type: ignore
-                friendly_value, get_h5_typename(value)  # type: ignore
+            json_value, compressed = maybe_compress_summary(
+                friendly_value, get_h5_typename(value)
             )
             if compressed:
                 # TODO(jhr): impleement me
@@ -365,7 +362,7 @@ class InterfaceBase(object):
         if artifact.description:
             proto_artifact.description = artifact.description
         if artifact.metadata:
-            proto_artifact.metadata = json.dumps(json_friendly_val(artifact.metadata))  # type: ignore
+            proto_artifact.metadata = json.dumps(json_friendly_val(artifact.metadata))
         proto_artifact.incremental_beta1 = artifact.incremental
         self._make_artifact_manifest(artifact.manifest, obj=proto_artifact.manifest)
         return proto_artifact
@@ -489,20 +486,50 @@ class InterfaceBase(object):
     def _publish_telemetry(self, telem: tpb.TelemetryRecord) -> None:
         raise NotImplementedError
 
+    def publish_partial_history(
+        self,
+        data: dict,
+        user_step: int,
+        step: Optional[int] = None,
+        flush: Optional[bool] = None,
+        publish_step: bool = True,
+        run: Optional["Run"] = None,
+    ) -> None:
+        run = run or self._run
+
+        data = history_dict_to_json(run, data, step=user_step, ignore_copy_err=True)
+        data.pop("_step", None)
+
+        partial_history = pb.PartialHistoryRequest()
+        for k, v in data.items():
+            item = partial_history.item.add()
+            item.key = k
+            item.value_json = json_dumps_safer_history(v)
+        if publish_step and step is not None:
+            # assert step is not None
+            partial_history.step.num = step
+        if flush is not None:
+            partial_history.action.flush = flush
+        self._publish_partial_history(partial_history)
+
+    @abstractmethod
+    def _publish_partial_history(self, history: pb.PartialHistoryRequest) -> None:
+        raise NotImplementedError
+
     def publish_history(
         self, data: dict, step: int = None, run: "Run" = None, publish_step: bool = True
     ) -> None:
         run = run or self._run
-        data = data_types.history_dict_to_json(run, data, step=step)
+        data = history_dict_to_json(run, data, step=step)
         history = pb.HistoryRecord()
         if publish_step:
             assert step is not None
             history.step.num = step
         data.pop("_step", None)
-        for k, v in six.iteritems(data):
+        for k, v in data.items():
             item = history.item.add()
             item.key = k
-            item.value_json = json_dumps_safer_history(v)  # type: ignore
+            item.value_json = json_dumps_safer_history(v)
         self._publish_history(history)
 
     @abstractmethod
